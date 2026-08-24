@@ -26,8 +26,8 @@ import (
 // Worker-variant callback deliveries: which failures count against it, that it is keyed per task
 // queue, that Describe reports a held-back callback as BLOCKED, and that BLOCKED is not terminal.
 //
-// Standalone Nexus operations are the only execution type that accepts Worker-variant callbacks;
-// see [WorkerCallbacksSuite].
+// Standalone Nexus operations stand in for every execution type here, since the delivery path a
+// callback takes is the same whatever it hangs off; see [TestWorkerCallbacks].
 type WorkerCallbacksCircuitBreakerSuite struct {
 	parallelsuite.Suite[*WorkerCallbacksCircuitBreakerSuite]
 }
