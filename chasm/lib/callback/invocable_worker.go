@@ -266,9 +266,9 @@ func (n invocableWorker) classifyDispatchResult(
 		}
 
 		if retryable {
-			return invocationResultRetry{userFacingErr}, "rpc-error"
+			return invocationResultRetry{userFacingErr}, "internal-rpc-error"
 		}
-		return invocationResultFail{userFacingErr}, "rpc-error"
+		return invocationResultFail{userFacingErr}, "internal-rpc-error"
 	}
 
 	// There wasn't an RPC error, but any application-level (e.g. the end Handler) errors would be

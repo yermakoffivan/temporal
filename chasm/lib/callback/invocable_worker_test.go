@@ -306,7 +306,7 @@ func TestExecuteInvocationTaskWorker_Outcomes(t *testing.T) {
 		{
 			name:                  "retryable-rpc-error",
 			responseErr:           status.Error(codes.Unavailable, "matching unavailable"),
-			expectedMetricOutcome: "rpc-error",
+			expectedMetricOutcome: "internal-rpc-error",
 			assertOutcome: func(t *testing.T, cb *Callback, err error) {
 				var destDownErr *queueserrors.DestinationDownError
 				require.ErrorAs(t, err, &destDownErr)
@@ -318,7 +318,7 @@ func TestExecuteInvocationTaskWorker_Outcomes(t *testing.T) {
 			// surfaced verbatim rather than blinded.
 			name:                  "rejected-rpc-request",
 			responseErr:           status.Error(codes.InvalidArgument, "malformed task queue name"),
-			expectedMetricOutcome: "rpc-error",
+			expectedMetricOutcome: "internal-rpc-error",
 			assertOutcome: func(t *testing.T, cb *Callback, err error) {
 				require.NoError(t, err)
 				requireTerminalFailure(t, cb, "malformed task queue name")
@@ -331,7 +331,7 @@ func TestExecuteInvocationTaskWorker_Outcomes(t *testing.T) {
 			name: "oversized-rpc-request",
 			responseErr: status.Error(codes.ResourceExhausted,
 				"grpc: received message larger than max (5242880 vs. 4194304)"),
-			expectedMetricOutcome: "rpc-error",
+			expectedMetricOutcome: "internal-rpc-error",
 			assertOutcome: func(t *testing.T, cb *Callback, err error) {
 				require.NoError(t, err)
 				requireTerminalFailure(t, cb, "received message larger than max")
@@ -343,7 +343,7 @@ func TestExecuteInvocationTaskWorker_Outcomes(t *testing.T) {
 			name: "throttled-rpc-request",
 			responseErr: serviceerror.NewResourceExhausted(
 				enumspb.RESOURCE_EXHAUSTED_CAUSE_RPS_LIMIT, "namespace rps limit exceeded"),
-			expectedMetricOutcome: "rpc-error",
+			expectedMetricOutcome: "internal-rpc-error",
 			assertOutcome: func(t *testing.T, cb *Callback, err error) {
 				var destDownErr *queueserrors.DestinationDownError
 				require.ErrorAs(t, err, &destDownErr)
@@ -355,7 +355,7 @@ func TestExecuteInvocationTaskWorker_Outcomes(t *testing.T) {
 			// reference ID and only the shape is asserted.
 			name:                  "non-retryable-rpc-error",
 			responseErr:           status.Error(codes.NotFound, "namespace not found"),
-			expectedMetricOutcome: "rpc-error",
+			expectedMetricOutcome: "internal-rpc-error",
 			assertOutcome: func(t *testing.T, cb *Callback, err error) {
 				require.NoError(t, err)
 				require.NotContains(t, cb.LastAttemptFailure.GetMessage(), "namespace not found")
