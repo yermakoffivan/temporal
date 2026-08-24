@@ -536,6 +536,7 @@ func TestRequestIDGeneratedWhenMissing(t *testing.T) {
 func TestValidateAndPopulateStartRequest_CombinesRequestAndCallbackLinks(t *testing.T) {
 	callbackValidator, err := callbacks.NewValidator(callbacks.ValidatorConfig{
 		MaxCallbacksPerExecution: func(string) int { return 2000 },
+		MaxIDLengthLimit:         func() int { return 1000 },
 		URLMaxLength:             func(string) int { return 1000 },
 		HeaderMaxSize:            func(string) int { return 2000 },
 		EndpointRules: func(string) callbacks.AddressMatchRules {
@@ -545,6 +546,10 @@ func TestValidateAndPopulateStartRequest_CombinesRequestAndCallbackLinks(t *test
 				},
 			}
 		},
+		MaxServiceNameLength:                func(string) int { return 1000 },
+		MaxOperationNameLength:              func(string) int { return 1000 },
+		WorkerSourceContextMaxSize:          func(string) int { return 64 * 1024 },
+		WorkerSourceContextAggregateMaxSize: func(string) int { return 2 * 1024 * 1024 },
 	})
 	require.NoError(t, err)
 

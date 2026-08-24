@@ -81,21 +81,35 @@ func (c *Callback) loadInvocationArgs(
 	ctx chasm.Context,
 	_ chasm.NoValue,
 ) (invocable, error) {
-	// Only Nexus-variant callbacks are supported for now.
-	callback := c.GetCallback().GetNexus()
-	if callback == nil {
+	// Reject unknown/unsupported callback variants.
+	switch c.GetCallback().GetVariant().(type) {
+	case *callbackspb.Callback_Nexus_, *callbackspb.Callback_Worker_:
+		// OK
+	default:
 		return nil, queueserrors.NewUnprocessableTaskError(
 			fmt.Sprintf("unprocessable callback variant: %T", c.GetCallback().GetVariant()),
 		)
 	}
 
+	// Get the parent CHASM object's Nexus result to be delivered.
 	target := c.CompletionSource.Get(ctx)
 	completion, err := target.GetNexusCompletion(ctx, c.RequestId)
 	if err != nil {
 		return nil, err
 	}
 
-	if callback.Url == chasm.NexusCompletionHandlerURL {
+	if worker := c.GetCallback().GetWorker(); worker != nil {
+		return invocableWorker{
+			callback:   worker,
+			completion: completion,
+			startTime:  ctx.Now(c),
+			requestID:  c.RequestId,
+			attempt:    c.Attempt,
+		}, nil
+	}
+
+	callback := c.GetCallback().GetNexus()
+	if callback.GetUrl() == chasm.NexusCompletionHandlerURL {
 		return invocableInternal{
 			callback:   callback,
 			attempt:    c.Attempt,
@@ -143,6 +157,12 @@ func (c *Callback) saveResult(
 			fmt.Sprintf("unrecognized callback result %v", input.result),
 		)
 	}
+}
+
+// SourceContextSize returns the size in bytes of the Worker source context this callback carries,
+// or 0 for any other variant. Used to enforce an aggregate cap for an execution's callbacks.
+func (c *Callback) SourceContextSize() int {
+	return c.GetCallback().GetWorker().GetSourceContext().Size()
 }
 
 // ToAPICallback converts a CHASM callback to API callback proto.
@@ -195,8 +215,31 @@ func (c *Callback) setResult(cbi *callbackpb.CallbackInfo) {
 	}
 }
 
-// APIState converts the CHASM callback status to the API CallbackState enum.
-func (c *Callback) APIState() (enumspb.CallbackState, error) {
+// APIState converts the CHASM callback status to the API CallbackState enum along with the relevant
+// circuit breaker's blocking status.
+func (c *Callback) APIState(ctx chasm.Context) (enumspb.CallbackState, string, error) {
+	state, err := c.apiStatus()
+	if err != nil {
+		return enumspb.CALLBACK_STATE_UNSPECIFIED, "", err
+	}
+
+	// The circuit breaker is only relevant for scheduled callbacks.
+	if state != enumspb.CALLBACK_STATE_SCHEDULED {
+		return state, "", nil
+	}
+
+	cbCtx := callbackContextFromChasm(ctx)
+	destination, err := c.Destination()
+	if err != nil {
+		return enumspb.CALLBACK_STATE_UNSPECIFIED, "", err
+	}
+	if !cbCtx.destinationBlocked(ctx.ExecutionKey().NamespaceID, destination) {
+		return state, "", nil
+	}
+	return enumspb.CALLBACK_STATE_BLOCKED, "The circuit breaker is open.", nil
+}
+
+func (c *Callback) apiStatus() (enumspb.CallbackState, error) {
 	switch c.Status {
 	case callbackspb.CALLBACK_STATUS_STANDBY:
 		return enumspb.CALLBACK_STATE_STANDBY, nil
@@ -216,21 +259,22 @@ func (c *Callback) APIState() (enumspb.CallbackState, error) {
 }
 
 // ToAPICallbackInfo returns the API CallbackInfo based on the current state of the CHASM component.
-func (c *Callback) ToAPICallbackInfo() (*callbackpb.CallbackInfo, error) {
+func (c *Callback) ToAPICallbackInfo(ctx chasm.Context) (*callbackpb.CallbackInfo, error) {
 	apiCb, err := c.ToAPICallback()
 	if err != nil {
 		return nil, err
 	}
-	apiState, err := c.APIState()
+	apiState, blockedReason, err := c.APIState(ctx)
 	if err != nil {
 		return nil, err
 	}
 
 	info := &callbackpb.CallbackInfo{
-		Callback:         apiCb,
-		RegistrationTime: common.CloneProto(c.RegistrationTime),
-		State:            apiState,
-		// BlockedReason is unimplemented; only the workflow Describe path computes it.
+		Callback:                apiCb,
+		RegistrationTime:        common.CloneProto(c.RegistrationTime),
+		State:                   apiState,
+		BlockedReason:           blockedReason,
+		RequestId:               c.RequestId,
 		Attempt:                 c.Attempt,
 		LastAttemptCompleteTime: common.CloneProto(c.LastAttemptCompleteTime),
 		LastAttemptFailure:      common.CloneProto(c.LastAttemptFailure),
@@ -256,9 +300,6 @@ func FromAPICallback(cb *commonpb.Callback) (*callbackspb.Callback, error) {
 		}
 		return res, nil
 	case *commonpb.Callback_Worker_:
-		// Conversion is implemented ahead of the rest of the feature, but is currently
-		// unreachable. If somehow this gets persisted, executing the callback will
-		// fail with an UnprocessableTaskError and retried until it is DLQ'd.
 		res.Variant = &callbackspb.Callback_Worker_{
 			Worker: &callbackspb.Callback_Worker{
 				TaskQueueName: variant.Worker.GetTaskQueueName(),
@@ -271,6 +312,13 @@ func FromAPICallback(cb *commonpb.Callback) (*callbackspb.Callback, error) {
 	default:
 		return nil, serviceerror.NewInvalidArgumentf("unsupported callback variant: %T", variant)
 	}
+}
+
+// Destination returns the destination this callback's invocation tasks are grouped under. Callers
+// outside this package need it to look the callback up in per-destination structures such as the
+// outbound queue's circuit breaker pool.
+func (c *Callback) Destination() (string, error) {
+	return callbackDestination(c.GetCallback())
 }
 
 // ScheduleStandbyCallbacks transitions all STANDBY callbacks to SCHEDULED state,

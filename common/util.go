@@ -775,18 +775,22 @@ func getFieldNameFromStruct(structPtr any, fieldPtr any) (string, error) {
 	return "", serviceerror.NewInternal("field not found in the struct")
 }
 
-// IsRetryableRPCError checks if the error is a retryable gRPC error.
-func IsRetryableRPCError(err error) bool {
-	var st *status.Status
+// GetRPCStatus attempts to get the gRPC status from the error if possible.
+// Returns nil, false if it was not a gRPC-induced error.
+func GetRPCStatus(err error) (*status.Status, bool) {
 	stGetter, ok := err.(interface{ Status() *status.Status })
 	if ok {
-		st = stGetter.Status()
-	} else {
-		st, ok = status.FromError(err)
-		if !ok {
-			// Not a gRPC induced error
-			return false
-		}
+		return stGetter.Status(), true
+	}
+	return status.FromError(err)
+}
+
+// IsRetryableRPCError checks if the error is a retryable gRPC error.
+func IsRetryableRPCError(err error) bool {
+	st, ok := GetRPCStatus(err)
+	if !ok {
+		// Not a gRPC error.
+		return false
 	}
 	// nolint:exhaustive
 	switch st.Code() {

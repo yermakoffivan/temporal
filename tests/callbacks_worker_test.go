@@ -5,6 +5,7 @@ import (
 	"testing"
 	"time"
 
+<<<<<<< HEAD
 	"github.com/google/uuid"
 	"github.com/stretchr/testify/require"
 	commonpb "go.temporal.io/api/common/v1"
@@ -83,11 +84,269 @@ func workerCallback(taskQueue string) *commonpb.Callback {
 				TaskQueueName: taskQueue,
 				Service:       workerCallbackService,
 				Operation:     workerCallbackOperation,
+=======
+	"github.com/nexus-rpc/sdk-go/nexus"
+	"github.com/stretchr/testify/require"
+	commonpb "go.temporal.io/api/common/v1"
+	enumspb "go.temporal.io/api/enums/v1"
+	notificationpb "go.temporal.io/api/notificationservice/v1"
+	"go.temporal.io/api/workflowservice/v1"
+	sdkworker "go.temporal.io/sdk/worker"
+	"go.temporal.io/server/chasm/lib/callback"
+	"go.temporal.io/server/chasm/lib/nexusoperation"
+	"go.temporal.io/server/common/dynamicconfig"
+	"go.temporal.io/server/common/payload"
+	"go.temporal.io/server/common/testing/await"
+	"go.temporal.io/server/common/testing/parallelsuite"
+	"go.temporal.io/server/common/testing/protorequire"
+	"go.temporal.io/server/tests/testcore"
+)
+
+// WorkerCallbacksSuite covers Worker-variant completion callbacks, which deliver an execution's
+// outcome to a Nexus service on a worker polling within the same namespace rather than round
+// tripping through the frontend's Nexus HTTP endpoint.
+//
+// Standalone Nexus operations are the only execution type that accepts them. Workflows, workflow
+// updates, and standalone activities all pass callbacks.OnlyNexus() to the callback validator, so
+// a Worker-variant callback on any of those is rejected at the frontend.
+type WorkerCallbacksSuite struct {
+	parallelsuite.Suite[*WorkerCallbacksSuite]
+}
+
+func TestWorkerCallbacksSuite(t *testing.T) {
+	parallelsuite.Run(t, &WorkerCallbacksSuite{})
+}
+
+func (s *WorkerCallbacksSuite) TestCompletionDeliveredToWorker() {
+	env := newNexusTestEnv(s.T(), true,
+		testcore.WithDynamicConfig(dynamicconfig.EnableChasm, true),
+		testcore.WithDynamicConfig(dynamicconfig.EnableCHASMCallbacks, true),
+		testcore.WithDynamicConfig(nexusoperation.Enabled, true),
+		testcore.WithDynamicConfig(nexusoperation.EnabledCallbackKinds, []string{"worker"}),
+	)
+
+	// Endpoints the standalone operations themselves invoke. Their outcome is what the callback
+	// carries to the worker.
+	const operationResult = "sano-op-result"
+	const operationFailure = "deliberate failure"
+	successEndpoint := env.createSyncSuccessEndpoint(s.Context(), s.T(), operationResult)
+	failureEndpoint := env.createSyncFailureEndpoint(s.Context(), s.T(), operationFailure)
+
+	s.Run("SucceededOperation", func(s *WorkerCallbacksSuite) {
+		t := s.T()
+		ctx, cancel := context.WithTimeout(s.Context(), 30*time.Second)
+		defer cancel()
+
+		handler := newWorkerCallbackHandler(t, env)
+		sourceContext := payload.EncodeString("source-context")
+		cb := handler.callback(sourceContext)
+
+		operationID := testcore.RandomizeStr(t.Name())
+		startResp, err := env.startNexusOperation(ctx, &workflowservice.StartNexusOperationExecutionRequest{
+			OperationId:         operationID,
+			Endpoint:            successEndpoint,
+			CompletionCallbacks: []*commonpb.Callback{cb},
+		})
+		require.NoError(t, err)
+		require.True(t, startResp.GetStarted())
+
+		// The completion reaches the service the callback names, not the endpoint the operation ran
+		// against.
+		delivered := handler.awaitDelivery(ctx, t)
+		require.Nil(t, delivered.GetFailure())
+		require.NotNil(t, delivered.GetSuccess())
+		// The endpoint's handler returned a Go string, so the result travels as its JSON encoding.
+		require.JSONEq(t, `"`+operationResult+`"`, string(delivered.GetSuccess().GetData()))
+		// The context the callback was registered with is carried to the handler untouched.
+		protorequire.ProtoEqual(t, sourceContext, delivered.GetSourceContext())
+		handler.respond(ctx, t, nil)
+
+		// The handler accepted the delivery, so the callback is done rather than backing off for
+		// another attempt.
+		cbInfo := env.awaitCallbackInfo(ctx, t, operationID, enumspb.CALLBACK_STATE_SUCCEEDED)
+		require.NotNil(t, cbInfo.GetSuccess())
+		protorequire.ProtoEqual(t, cb, cbInfo.GetCallback())
+	})
+
+	// A failed operation delivers its failure to the same handler, in place of a result. The
+	// callback itself still succeeds: reporting a failure is a successful delivery.
+	s.Run("FailedOperation", func(s *WorkerCallbacksSuite) {
+		t := s.T()
+		ctx, cancel := context.WithTimeout(s.Context(), 30*time.Second)
+		defer cancel()
+
+		handler := newWorkerCallbackHandler(t, env)
+		cb := handler.callback(nil)
+
+		operationID := testcore.RandomizeStr(t.Name())
+		_, err := env.startNexusOperation(ctx, &workflowservice.StartNexusOperationExecutionRequest{
+			OperationId:         operationID,
+			Endpoint:            failureEndpoint,
+			CompletionCallbacks: []*commonpb.Callback{cb},
+		})
+		require.NoError(t, err)
+
+		delivered := handler.awaitDelivery(ctx, t)
+		require.Nil(t, delivered.GetSuccess())
+		require.NotNil(t, delivered.GetFailure())
+		// The OperationError the server wraps the outcome in for transport is unwrapped before the
+		// handler sees it, so the endpoint's own failure is what arrives.
+		require.Equal(t, operationFailure, delivered.GetFailure().GetCause().GetMessage())
+		handler.respond(ctx, t, nil)
+
+		// A failed operation does not make for a failed callback.
+		cbInfo := env.awaitCallbackInfo(ctx, t, operationID, enumspb.CALLBACK_STATE_SUCCEEDED)
+		require.NotNil(t, cbInfo.GetSuccess())
+
+		// The operation itself is failed, and its outcome is the same failure the callback carried.
+		descResp := env.describeNexusOperation(ctx, t, operationID)
+		require.Equal(t, enumspb.NEXUS_OPERATION_EXECUTION_STATUS_FAILED, descResp.GetInfo().GetStatus())
+		require.Equal(t, operationFailure, descResp.GetFailure().GetCause().GetMessage())
+	})
+}
+
+// TestOversizedCompletionFailsPermanently drives a completion past the 4 MiB gRPC servers accept by
+// default, so matching rejects the dispatch with ResourceExhausted on receive. Those bytes are fixed
+// — every retry sends the same ones — so the callback must fail rather than retry until it is
+// abandoned, holding the task queue's circuit breaker open on the way.
+func (s *WorkerCallbacksSuite) TestOversizedCompletionFailsPermanently() {
+	env := newNexusTestEnv(s.T(), true,
+		testcore.WithDynamicConfig(dynamicconfig.EnableChasm, true),
+		testcore.WithDynamicConfig(dynamicconfig.EnableCHASMCallbacks, true),
+		testcore.WithDynamicConfig(nexusoperation.Enabled, true),
+		testcore.WithDynamicConfig(nexusoperation.EnabledCallbackKinds, []string{"worker"}),
+		// Raise the source context caps so this test reaches the transport limit rather than the
+		// validator. Finding #6's aggregate cap of 2 MiB would otherwise reject the request first.
+		testcore.WithDynamicConfig(callback.WorkerSourceContextMaxSize, 8*1024*1024),
+		testcore.WithDynamicConfig(callback.WorkerSourceContextAggregateMaxSize, 8*1024*1024),
+	)
+
+	t := s.T()
+	ctx, cancel := context.WithTimeout(s.Context(), 60*time.Second)
+	defer cancel()
+
+	endpointName := env.createSyncSuccessEndpoint(ctx, t, "operation-result")
+
+	// The dispatch carries the source context as json/protobuf, which base64s the bytes and so
+	// inflates them by about a third: 3.5 MiB here encodes to roughly 4.8 MiB, over the limit, while
+	// the start request carrying it stays under.
+	sourceContext := &commonpb.Payload{Data: make([]byte, 3500*1024)}
+
+	handler := newWorkerCallbackHandler(t, env)
+	operationID := testcore.RandomizeStr(t.Name())
+	_, err := env.startNexusOperation(ctx, &workflowservice.StartNexusOperationExecutionRequest{
+		OperationId:         operationID,
+		Endpoint:            endpointName,
+		CompletionCallbacks: []*commonpb.Callback{handler.callback(sourceContext)},
+	})
+	require.NoError(t, err)
+
+	// The operation itself is unaffected by the callback it cannot deliver.
+	await.Require(ctx, t, func(c *await.T) {
+		status := env.describeNexusOperation(c.Context(), c, operationID).GetInfo().GetStatus()
+		require.Equal(c, enumspb.NEXUS_OPERATION_EXECUTION_STATUS_COMPLETED, status)
+	}, 20*time.Second, 100*time.Millisecond)
+
+	// FAILED rather than BACKING_OFF is the whole point: the delivery is not retried.
+	cbInfo := env.awaitCallbackInfo(ctx, t, operationID, enumspb.CALLBACK_STATE_FAILED)
+	require.NotNil(t, cbInfo.GetFailure())
+	// The size rejection describes the caller's own payload, so it is surfaced rather than blinded
+	// behind a reference ID.
+	require.Contains(t, cbInfo.GetFailure().GetMessage(), "larger than max")
+	require.NotContains(t, cbInfo.GetFailure().GetMessage(), "reference-id")
+
+	// Matching never got the request, so the handler never ran.
+	require.Empty(t, handler.invocationCh)
+}
+
+// workerCallbackHandler is a Nexus service on a worker in the test namespace that receives
+// Worker-variant completion callbacks. Each delivered completion is handed to the test on
+// invocationCh, and the handler then blocks until the test answers on resultCh, so a test can
+// drive the delivery outcome the server observes.
+type workerCallbackHandler struct {
+	taskQueue string
+	service   string
+	operation string
+
+	invocationCh chan *notificationpb.OnCompleteRequest
+	resultCh     chan error
+	doneCh       chan struct{}
+}
+
+// newWorkerCallbackHandler starts a worker polling its own task queue, so a delivery has to be
+// routed by the callback rather than by the task queue the source execution used. The worker stops
+// when t cleans up.
+func newWorkerCallbackHandler(t *testing.T, env *NexusTestEnv) *workerCallbackHandler {
+	t.Helper()
+
+	h := &workerCallbackHandler{
+		taskQueue: testcore.RandomizeStr(t.Name() + "-callback-handler"),
+		service:   "completion-service",
+		operation: "on-complete",
+		// Buffered so the server can deliver a redelivery before the test drains the first attempt.
+		invocationCh: make(chan *notificationpb.OnCompleteRequest, 4),
+		resultCh:     make(chan error, 4),
+		doneCh:       make(chan struct{}),
+	}
+
+	service := nexus.NewService(h.service)
+	require.NoError(t, service.Register(nexus.NewSyncOperation(h.operation, h.handle)))
+
+	worker := sdkworker.New(env.SdkClient(), h.taskQueue, sdkworker.Options{})
+	worker.RegisterNexusService(service)
+	require.NoError(t, worker.Start())
+	t.Cleanup(func() {
+		// Unblock a handler still waiting on the test before stopping the worker.
+		close(h.doneCh)
+		worker.Stop()
+	})
+	return h
+}
+
+func (h *workerCallbackHandler) handle(
+	ctx context.Context,
+	req *notificationpb.OnCompleteRequest,
+	_ nexus.StartOperationOptions,
+) (*notificationpb.OnCompleteResponse, error) {
+	shuttingDown := nexus.NewHandlerErrorf(nexus.HandlerErrorTypeInternal, "test is shutting down")
+
+	select {
+	case h.invocationCh <- req:
+	case <-h.doneCh:
+		return nil, shuttingDown
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	}
+
+	select {
+	case err := <-h.resultCh:
+		if err != nil {
+			return nil, err
+		}
+		return &notificationpb.OnCompleteResponse{}, nil
+	case <-h.doneCh:
+		return nil, shuttingDown
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	}
+}
+
+// callback returns a Worker-variant callback addressed to this handler, carrying sourceContext.
+func (h *workerCallbackHandler) callback(sourceContext *commonpb.Payload) *commonpb.Callback {
+	return &commonpb.Callback{
+		Variant: &commonpb.Callback_Worker_{
+			Worker: &commonpb.Callback_Worker{
+				TaskQueueName: h.taskQueue,
+				Service:       h.service,
+				Operation:     h.operation,
+				SourceContext: sourceContext,
+>>>>>>> 6166f7460 (Support Worker-variant callbacks)
 			},
 		},
 	}
 }
 
+<<<<<<< HEAD
 // requireWorkerCallbackRegistered asserts that the execution carries exactly the one Worker
 // callback that was attached to it.
 func requireWorkerCallbackRegistered(t require.TestingT, cbs []observedCallback, taskQueue string) {
@@ -493,6 +752,27 @@ func describeActivityCallbacks(ctx context.Context, env *testcore.TestEnv, activ
 			})
 		}
 		return cbs, nil
+=======
+// awaitDelivery returns the next completion delivered to the handler. The handler stays blocked
+// until [workerCallbackHandler.respond] answers it.
+func (h *workerCallbackHandler) awaitDelivery(ctx context.Context, t require.TestingT) *notificationpb.OnCompleteRequest {
+	select {
+	case req := <-h.invocationCh:
+		return req
+	case <-ctx.Done():
+		require.FailNow(t, "timed out waiting for the worker callback to be delivered")
+		return nil
+	}
+}
+
+// respond hands err back to the server as the handler's answer to a delivery. A nil err reports a
+// successful delivery.
+func (h *workerCallbackHandler) respond(ctx context.Context, t require.TestingT, err error) {
+	select {
+	case h.resultCh <- err:
+	case <-ctx.Done():
+		require.FailNow(t, "timed out handing the worker callback result back to the handler")
+>>>>>>> 6166f7460 (Support Worker-variant callbacks)
 	}
 }
 

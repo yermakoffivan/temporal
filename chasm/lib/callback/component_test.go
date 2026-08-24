@@ -2,6 +2,7 @@ package callback
 
 import (
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/require"
 	callbackpb "go.temporal.io/api/callback/v1"
@@ -15,6 +16,7 @@ import (
 	"go.temporal.io/server/common/testing/protorequire"
 	queueserrors "go.temporal.io/server/service/history/queues/errors"
 	"google.golang.org/protobuf/types/known/emptypb"
+	"google.golang.org/protobuf/types/known/timestamppb"
 )
 
 func TestFromAPICallback(t *testing.T) {
@@ -131,29 +133,54 @@ func TestFromAPICallback(t *testing.T) {
 			})
 		}
 	})
+
+	// Confirm a malformed CHASM Callback fails to be converted into the api proto.
+	t.Run("UnsupportedVariant", func(t *testing.T) {
+		cb := &Callback{CallbackState: &callbackspb.CallbackState{
+			Callback: &callbackspb.Callback{},
+		}}
+		_, err := cb.ToAPICallback()
+		var internalErr *serviceerror.Internal
+		require.ErrorAs(t, err, &internalErr)
+		require.ErrorContains(t, err, "unsupported CHASM callback type")
+	})
 }
 
-// Asserts that CHASM Callbacks do not support the new Worker callback variant.
-func TestWorkerCallbacksNotSupported(t *testing.T) {
-	apiCb := &commonpb.Callback{
-		Variant: &commonpb.Callback_Worker_{
-			Worker: &commonpb.Callback_Worker{},
-		},
-	}
-	chasmCB, err := FromAPICallback(apiCb)
-	require.NoError(t, err)
-
+// A callback whose variant this server doesn't know how to invoke can still be persisted (by a server that
+// does, or by a future version), so its invocation task has to be rejected rather than crash.
+func TestLoadInvocationArgsUnsupportedVariant(t *testing.T) {
 	cb := &Callback{
 		CallbackState: &callbackspb.CallbackState{
-			Callback: chasmCB,
+			Callback: &callbackspb.Callback{},
 		},
 	}
-	_, err = cb.loadInvocationArgs(&chasm.MockMutableContext{}, nil)
+	_, err := cb.loadInvocationArgs(&chasm.MockMutableContext{}, nil)
 
 	var unprocessableErr *queueserrors.UnprocessableTaskError
 	require.ErrorAs(t, err, &unprocessableErr)
 	require.ErrorContains(t, err, "unprocessable callback variant")
-	require.ErrorContains(t, err, "Callback_Worker_")
+}
+
+// Confirm the request ID passed to NewCallback is perssited, and set in ToAPICallbackInfo.
+func TestToAPICallbackInfoCarriesTheRequestID(t *testing.T) {
+	ctx := &chasm.MockContext{}
+	ctx.RegisterLibrary(NewNilLibrary())
+
+	cb := NewCallback(
+		"callback-request-id",
+		timestamppb.New(time.Unix(1, 0)),
+		&callbackspb.Callback{Variant: &callbackspb.Callback_Worker_{
+			Worker: &callbackspb.Callback_Worker{
+				TaskQueueName: "completions-task-queue",
+				Service:       "HTTPAdapter",
+				Operation:     "DeliverAsWebhook",
+			},
+		}},
+	)
+
+	info, err := cb.ToAPICallbackInfo(ctx)
+	require.NoError(t, err)
+	require.Equal(t, "callback-request-id", info.GetRequestId())
 }
 
 // Verify the setResult method sets the "result" field based on the Callback state.

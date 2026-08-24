@@ -2,6 +2,7 @@ package callbacks
 
 import (
 	"context"
+	"reflect"
 	"regexp"
 	"strings"
 	"testing"
@@ -45,14 +46,15 @@ func newValidatorConfig() ValidatorConfig {
 		},
 	}
 	return ValidatorConfig{
-		MaxCallbacksPerExecution:   func(string) int { return 10 },
-		MaxIDLengthLimit:           func() int { return 10 },
-		URLMaxLength:               func(string) int { return 1000 },
-		HeaderMaxSize:              func(string) int { return 4096 },
-		EndpointRules:              func(string) AddressMatchRules { return allowAllAddresses },
-		MaxServiceNameLength:       func(string) int { return 40 },
-		MaxOperationNameLength:     func(string) int { return 40 },
-		WorkerSourceContextMaxSize: func(string) int { return 1000 },
+		MaxCallbacksPerExecution:            func(string) int { return 10 },
+		MaxIDLengthLimit:                    func() int { return 10 },
+		URLMaxLength:                        func(string) int { return 1000 },
+		HeaderMaxSize:                       func(string) int { return 4096 },
+		EndpointRules:                       func(string) AddressMatchRules { return allowAllAddresses },
+		MaxServiceNameLength:                func(string) int { return 40 },
+		MaxOperationNameLength:              func(string) int { return 40 },
+		WorkerSourceContextMaxSize:          func(string) int { return 1000 },
+		WorkerSourceContextAggregateMaxSize: func(string) int { return 4000 },
 	}
 }
 
@@ -70,6 +72,17 @@ func TestValidatorConfigValidate(t *testing.T) {
 
 	_, err := NewValidator(cfg)
 	require.EqualError(t, err, "missing required fields: [URLMaxLength EndpointRules]")
+}
+
+// Catch when a new field is added to ValidatorConfig but not checked in Validate().
+func TestValidatorConfigValidateNamesEveryField(t *testing.T) {
+	_, err := NewValidator(ValidatorConfig{})
+	require.Error(t, err)
+
+	for field := range reflect.TypeFor[ValidatorConfig]().Fields() {
+		require.Containsf(t, err.Error(), field.Name,
+			"ValidatorConfig.%s is not checked by Validate", field.Name)
+	}
 }
 
 func TestValidateCallbacks(t *testing.T) {

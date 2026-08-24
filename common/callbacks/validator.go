@@ -24,6 +24,22 @@ type Validator interface {
 	// Validate rejects callbacks that are not enabled for the execution, or are malformed.
 	// Will mutate the supplied Callbacks to normalize. e.g. converting Nexus headers to lower-case.
 	Validate(ctx context.Context, namespaceName string, cbs []*commonpb.Callback, opts ValidatorOptions) error
+
+	// ValidateTotalSourceContextSize checks that adding addingBytes of Worker source context to an
+	// execution already carrying existingBytes will not exceed the per-execution limit.
+	ValidateTotalSourceContextSize(namespaceName string, existingBytes, addingBytes int) error
+}
+
+// SourceContextSize returns the total size in bytes of the Worker source context payloads carried
+// by cbs. Callbacks of any other kind contribute nothing.
+func SourceContextSize(cbs []*commonpb.Callback) int {
+	total := 0
+	for _, cb := range cbs {
+		if sc := cb.GetWorker().GetSourceContext(); sc != nil {
+			total += sc.Size()
+		}
+	}
+	return total
 }
 
 // ValidatorConfig holds the limits a [Validator] enforces.
@@ -37,15 +53,19 @@ type ValidatorConfig struct {
 	EndpointRules dynamicconfig.TypedPropertyFnWithNamespaceFilter[AddressMatchRules]
 
 	// Worker-variant limits.
-	MaxServiceNameLength       dynamicconfig.IntPropertyFnWithNamespaceFilter
-	MaxOperationNameLength     dynamicconfig.IntPropertyFnWithNamespaceFilter
-	WorkerSourceContextMaxSize dynamicconfig.IntPropertyFnWithNamespaceFilter
+	MaxServiceNameLength                dynamicconfig.IntPropertyFnWithNamespaceFilter
+	MaxOperationNameLength              dynamicconfig.IntPropertyFnWithNamespaceFilter
+	WorkerSourceContextMaxSize          dynamicconfig.IntPropertyFnWithNamespaceFilter
+	WorkerSourceContextAggregateMaxSize dynamicconfig.IntPropertyFnWithNamespaceFilter
 }
 
 func (vc *ValidatorConfig) Validate() error {
 	var missingFields []string
 	if vc.MaxCallbacksPerExecution == nil {
 		missingFields = append(missingFields, "MaxCallbacksPerExecution")
+	}
+	if vc.MaxIDLengthLimit == nil {
+		missingFields = append(missingFields, "MaxIDLengthLimit")
 	}
 	if vc.URLMaxLength == nil {
 		missingFields = append(missingFields, "URLMaxLength")
@@ -55,6 +75,18 @@ func (vc *ValidatorConfig) Validate() error {
 	}
 	if vc.EndpointRules == nil {
 		missingFields = append(missingFields, "EndpointRules")
+	}
+	if vc.MaxServiceNameLength == nil {
+		missingFields = append(missingFields, "MaxServiceNameLength")
+	}
+	if vc.MaxOperationNameLength == nil {
+		missingFields = append(missingFields, "MaxOperationNameLength")
+	}
+	if vc.WorkerSourceContextMaxSize == nil {
+		missingFields = append(missingFields, "WorkerSourceContextMaxSize")
+	}
+	if vc.WorkerSourceContextAggregateMaxSize == nil {
+		missingFields = append(missingFields, "WorkerSourceContextAggregateMaxSize")
 	}
 
 	if len(missingFields) != 0 {
@@ -183,5 +215,16 @@ func (v *validator) validateWorker(namespaceName string, cb *commonpb.Callback_W
 			size, v.config.WorkerSourceContextMaxSize(namespaceName))
 	}
 
+	return nil
+}
+
+func (v *validator) ValidateTotalSourceContextSize(namespaceName string, existingBytes, addingBytes int) error {
+	maxSize := v.config.WorkerSourceContextAggregateMaxSize(namespaceName)
+	if existingBytes+addingBytes > maxSize {
+		return serviceerror.NewFailedPreconditionf(
+			"cannot attach more than %d bytes of callback source_context to an execution "+
+				"(%d bytes already attached, %d more requested)",
+			maxSize, existingBytes, addingBytes)
+	}
 	return nil
 }

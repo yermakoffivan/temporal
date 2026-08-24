@@ -19,10 +19,10 @@ import (
 	persistencespb "go.temporal.io/server/api/persistence/v1"
 	"go.temporal.io/server/chasm"
 	chasmcallback "go.temporal.io/server/chasm/lib/callback"
-	callbackspb "go.temporal.io/server/chasm/lib/callback/gen/callbackpb/v1"
 	"go.temporal.io/server/chasm/lib/nexusoperation"
 	chasmworkflow "go.temporal.io/server/chasm/lib/workflow"
 	"go.temporal.io/server/common"
+	commoncallbacks "go.temporal.io/server/common/callbacks"
 	"go.temporal.io/server/common/definition"
 	"go.temporal.io/server/common/locks"
 	"go.temporal.io/server/common/log"
@@ -283,7 +283,6 @@ func Invoke(
 			chasmCtx,
 			executionInfo,
 			executionState,
-			outboundQueueCBPool,
 			shard.GetLogger(),
 		)
 		if err != nil {
@@ -506,7 +505,6 @@ func buildCallbackInfosFromChasm(
 	chasmCtx chasm.Context,
 	executionInfo *persistencespb.WorkflowExecutionInfo,
 	executionState *persistencespb.WorkflowExecutionState,
-	outboundQueueCBPool *circuitbreakerpool.OutboundQueueCircuitBreakerPool,
 	logger log.Logger,
 ) ([]*workflowpb.CallbackInfo, error) {
 	result := make([]*workflowpb.CallbackInfo, 0, len(wf.Callbacks))
@@ -517,7 +515,7 @@ func buildCallbackInfosFromChasm(
 			Variant: &workflowpb.CallbackInfo_Trigger_WorkflowClosed{},
 		}
 
-		callbackInfo, err := buildCallbackInfoFromChasm(namespaceID, callback, trigger, outboundQueueCBPool)
+		callbackInfo, err := buildChasmCallbackInfo(chasmCtx, callback, trigger)
 		if err != nil {
 			logger.Error(
 				"failed to build callback info from CHASM callback",
@@ -548,7 +546,7 @@ func buildCallbackInfosFromChasm(
 				},
 			}
 
-			callbackInfo, err := buildCallbackInfoFromChasm(namespaceID, callback, trigger, outboundQueueCBPool)
+			callbackInfo, err := buildChasmCallbackInfo(chasmCtx, callback, trigger)
 			if err != nil {
 				logger.Error(
 					"failed to build callback info from CHASM update callback",
@@ -569,61 +567,34 @@ func buildCallbackInfosFromChasm(
 	return result, nil
 }
 
-// buildCallbackInfoFromChasm converts a single CHASM callback to API format.
-func buildCallbackInfoFromChasm(
-	namespaceID namespace.ID,
-	callback *chasmcallback.Callback,
-	trigger *workflowpb.CallbackInfo_Trigger,
-	outboundQueueCBPool *circuitbreakerpool.OutboundQueueCircuitBreakerPool,
-) (*workflowpb.CallbackInfo, error) {
-	// Create a circuit breaker state checker function
-	circuitBreakerState := func(destination string) bool {
-		cb := outboundQueueCBPool.Get(tasks.TaskGroupNamespaceIDAndDestination{
-			TaskGroup:   callbacks.TaskTypeInvocation,
-			NamespaceID: namespaceID.String(),
-			Destination: destination,
-		})
-		return cb.State() != gobreaker.StateClosed
-	}
-
-	return buildChasmCallbackInfo(callback, trigger, circuitBreakerState)
-}
-
 // buildChasmCallbackInfo converts a single CHASM callback to API CallbackInfo format.
 // Returns nil if the callback should not be included in the response.
+//
+//nolint:revive // context.Context is an input parameter for chasm component methods, not a function parameter
 func buildChasmCallbackInfo(
+	ctx chasm.Context,
 	cb *chasmcallback.Callback,
 	trigger *workflowpb.CallbackInfo_Trigger,
-	circuitBreakerState func(destination string) bool,
 ) (*workflowpb.CallbackInfo, error) {
-	switch cb.GetCallback().GetVariant().(type) {
-	case *callbackspb.Callback_Nexus_, *callbackspb.Callback_Worker_:
-	default:
-		// Callbacks of an unrecognized variant are omitted rather than reported as an error.
+	apiCb, err := cb.ToAPICallback()
+	if err != nil {
+		return nil, err
+	}
+
+	cbKind := commoncallbacks.KindOf(apiCb)
+	if cbKind == commoncallbacks.KindUnknown {
+		// A variant this server does not know how to describe, e.g. one written by a newer server.
+		// Omit it rather than failing the whole response.
 		return nil, nil
 	}
 
-	cbSpec, err := cb.ToAPICallback()
+	state, blockedReason, err := cb.APIState(ctx)
 	if err != nil {
 		return nil, err
-	}
-	state, err := cb.APIState()
-	if err != nil {
-		return nil, err
-	}
-
-	var blockedReason string
-	// Only Nexus callbacks are dispatched over the outbound queue, so only they can be blocked
-	// by its circuit breaker.
-	if state == enumspb.CALLBACK_STATE_SCHEDULED && cbSpec.GetNexus() != nil {
-		if circuitBreakerState(cbSpec.GetNexus().GetUrl()) {
-			state = enumspb.CALLBACK_STATE_BLOCKED
-			blockedReason = "The circuit breaker is open."
-		}
 	}
 
 	return &workflowpb.CallbackInfo{
-		Callback:                cbSpec,
+		Callback:                apiCb,
 		Trigger:                 trigger,
 		RegistrationTime:        common.CloneProto(cb.RegistrationTime),
 		State:                   state,
