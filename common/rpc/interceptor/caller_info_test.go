@@ -2,6 +2,7 @@ package interceptor
 
 import (
 	"context"
+	"net/http"
 	"testing"
 
 	"github.com/nexus-rpc/sdk-go/nexus"
@@ -10,6 +11,7 @@ import (
 	"go.temporal.io/api/workflowservice/v1"
 	"go.temporal.io/server/common/headers"
 	"go.temporal.io/server/common/namespace"
+	"go.temporal.io/server/common/nexus/nexusrpc"
 	interceptornexus "go.temporal.io/server/common/rpc/interceptor/nexus"
 	"go.uber.org/mock/gomock"
 	"google.golang.org/grpc"
@@ -127,6 +129,8 @@ func (s *callerInfoSuite) TestIntercept_CallerName() {
 }
 
 func (s *callerInfoSuite) TestInterceptNexus() {
+	completeInput, err := interceptornexus.NewCompleteOpInput(testNamespace, &nexusrpc.CompletionRequest{HTTPRequest: &http.Request{}}, nil)
+	s.NoError(err)
 	for _, tc := range []struct {
 		name           string
 		input          interceptornexus.InterceptorInput
@@ -145,7 +149,7 @@ func (s *callerInfoSuite) TestInterceptNexus() {
 		},
 		{
 			name:           "complete",
-			input:          interceptornexus.NewCompleteOpInput(testNamespace, nil),
+			input:          completeInput,
 			expectedOrigin: "CompleteNexusOperation",
 		},
 	} {

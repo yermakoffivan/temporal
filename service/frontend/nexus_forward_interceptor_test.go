@@ -142,7 +142,7 @@ func TestNexusForwardingInterceptorInterceptNexus(t *testing.T) {
 			input.WithRequestMetadata(interceptornexus.RequestMetadata{
 				NamespaceEntry: tc.namespace,
 			})
-			ctx := interceptor.WithTelemetryContext(context.Background(), &forwardingTelemetryContext{})
+			ctx := context.Background()
 			nextCalled := false
 			result, err := forwarder.InterceptNexus(
 				ctx,
@@ -174,30 +174,6 @@ func TestNexusForwardingInterceptorInterceptNexus(t *testing.T) {
 		})
 	}
 }
-
-type forwardingTelemetryContext struct {
-	failureSource string
-}
-
-func (*forwardingTelemetryContext) MetricsHandler(error) metrics.Handler {
-	return metrics.NoopMetricsHandler
-}
-
-func (*forwardingTelemetryContext) MetricsHandlerForInterceptors() metrics.Handler {
-	return metrics.NoopMetricsHandler
-}
-
-func (*forwardingTelemetryContext) MetricsLogger() log.Logger {
-	return log.NewNoopLogger()
-}
-
-func (*forwardingTelemetryContext) SetMetricsOutcome(string) {}
-
-func (c *forwardingTelemetryContext) SetFailureSource(source string) {
-	c.failureSource = source
-}
-
-func (*forwardingTelemetryContext) HandleRequestError(error) {}
 
 type testFrontendHTTPClientCache struct {
 	clients map[string]*common.FrontendHTTPClient
